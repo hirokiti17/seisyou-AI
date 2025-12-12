@@ -1,0 +1,353 @@
+# ==============================
+# 1. Googleドライブをマウント
+# ==============================
+from google.colab import drive
+drive.mount('/content/drive')
+
+# ==============================
+# 2. 必要ライブラリのインストール
+# ==============================
+!pip install -q torch torchvision torchaudio
+!pip install -q transformers accelerate datasets peft
+!pip install -q huggingface_hub
+!pip install -q bitsandbytes  # GPU用量子化ライブラリ
+
+# ==============================
+# 3. Hugging Faceログイン
+# ==============================
+from huggingface_hub import login
+import os
+
+hf_token = os.getenv("HF_TOKEN")
+
+# ==============================
+# 4. GPUデバイスの確認
+# ==============================
+import torch
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+# ==============================
+# 5. モデルとLoRA設定 (ELYZA Llama-3)
+# ==============================
+!pip install -U bitsandbytes transformers accelerate
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model
+import torch
+
+model_name = "elyza/Llama-3-ELYZA-JP-8B"
+
+# Tokenizer
+tokenizer = AutoTokenizer.from_pretrained(
+    model_name,
+    use_fast=False,
+    trust_remote_code=True,
+)
+
+# PAD 修正: PADトークンを確保し、モデルの埋め込み層を調整
+# Llama-3-ELYZA-JP-8B は通常 <|eot_id|> を EOS として持つが、PADは未定義
+# PADトークンが存在しない場合、EOSトークンをPADトークンとして設定
+if tokenizer.pad_token is None:
+    if tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    else:
+        # Fallback: EOSもなければ新しいPADトークンを追加
+        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+
+print("EOS:", tokenizer.eos_token, tokenizer.eos_token_id)
+print("PAD:", tokenizer.pad_token, tokenizer.pad_token_id)
+
+# 量子化
+quant_cfg = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16,
+)
+
+# モデル
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    quantization_config=quant_cfg,
+    device_map="auto",
+)
+
+# LoRA適用前に実行することが重要
+if tokenizer.pad_token_id is not None and len(tokenizer) > model.config.vocab_size:
+     model.resize_token_embeddings(len(tokenizer))
+
+# モデルのconfigにもpad_token_idを設定
+# これにより、モデルが自身のパディングトークンIDを知る
+model.config.pad_token_id = tokenizer.pad_token_id
+
+# LoRA
+lora_cfg = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=["q_proj", "v_proj"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM",
+)
+
+model = get_peft_model(model, lora_cfg)
+
+model.gradient_checkpointing_enable()
+model.enable_input_require_grads()
+model.config.use_cache = False
+
+!head -n 20 /content/drive/MyDrive/AIdata/makura_no_soshi_qa.jsonl
+
+# ==============================
+# 6. データセット読み込み
+# ==============================
+from datasets import load_dataset, Features, Value
+
+# ChatML用の学習データ（instruction, input, output）
+qa_features = Features({
+    "prompt": Value("string"),
+    "completion": Value("string"),
+})
+
+# ---- ここで JSONL を直接読み込む ----
+dataset_train = load_dataset(
+    "json",
+    data_files="/content/drive/MyDrive/AIdata/makura_no_soshi_qa.jsonl",
+    split="train",
+    features=qa_features
+)
+
+# サンプル確認
+print("=== サンプル（1件目）===")
+print(dataset_train[0])
+
+# ==============================
+# 7. トークナイズ処理（ChatML学習用）
+# ==============================
+
+tokenizer.pad_token = tokenizer.eos_token
+model.config.pad_token_id = tokenizer.eos_token_id
+
+MAX_LEN = 1024
+
+def tokenize_chatml(example):
+    """
+    ChatML形式:
+      example["prompt"]
+      example["completion"]
+    を結合して1つの input_ids と labels を作る処理。
+    """
+
+    # --- prompt の token ---
+    prompt_ids = tokenizer(
+        example["prompt"],
+        truncation=True,
+        max_length=MAX_LEN,
+        add_special_tokens=False,
+    )["input_ids"]
+
+    # --- completion の token ---
+    completion_ids = tokenizer(
+        example["completion"],
+        truncation=True,
+        max_length=MAX_LEN,
+        add_special_tokens=False,
+    )["input_ids"]
+
+    # --- input_ids = prompt + completion の連結 ---
+    input_ids = prompt_ids + completion_ids
+
+    # --- labels = -100（prompt部分） + completion ---
+    labels = [-100] * len(prompt_ids) + completion_ids
+
+    # --- MAX_LEN 超えたら切る ---
+    input_ids = input_ids[:MAX_LEN]
+    labels = labels[:MAX_LEN]
+
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+    }
+
+print("ChatML tokenization ready.")
+
+# データセット適用
+tokenized_dataset = dataset_train.map(
+    tokenize_chatml,
+    batched=False,
+    remove_columns=dataset_train.column_names
+)
+
+# ==============================
+# 8. Trainer設定（ChatML 学習用）
+# ==============================
+from transformers import TrainingArguments, Trainer, DataCollatorForSeq2Seq
+
+# --- 重要：可変長バッチに対応するデータコラトラ ---
+data_collator = DataCollatorForSeq2Seq(
+    tokenizer=tokenizer,
+    model=model,
+    padding=True,
+    max_length=1024,
+    return_tensors="pt",
+)
+
+training_args = TrainingArguments(
+    output_dir="/content/drive/MyDrive/AIdata/makura_no_soshi_results",
+    per_device_train_batch_size=4,
+    per_device_eval_batch_size=4,
+    gradient_accumulation_steps=4,
+    num_train_epochs=3,
+    learning_rate=2e-4,
+    logging_steps=10,
+    save_steps=200,
+    save_total_limit=5,
+    bf16=True,
+    optim="adamw_torch",
+    report_to="none"
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_dataset,  # ← ChatML tokenized dataset
+    eval_dataset=tokenized_dataset,
+    data_collator=data_collator,
+)
+
+# ==============================
+# 9. 学習開始
+# ==============================
+trainer.train()
+
+# ==============================
+# 10. 最終保存（LoRA → 1つのモデルへマージ）
+# ==============================
+from peft import PeftModel
+
+save_dir = "/content/drive/MyDrive/AIdata/makura_no_soshi_results/final_model"
+
+# ① LoRAをマージ
+model = PeftModel.from_pretrained(model, "/content/drive/MyDrive/AIdata/makura_no_soshi_results/lora_adapter")
+model = model.merge_and_unload()
+
+# ② full-model 保存
+model.save_pretrained(save_dir)
+
+# ③ tokenizer 保存
+tokenizer.save_pretrained(save_dir)
+
+print("統合済みモデル（final_model）を保存しました:", save_dir)
+
+!ls -l "/content/drive/MyDrive/AIdata/makura_no_soshi_results/"
+
+# =============================
+# 11. テスト（ローカルモデル読み込み）
+# =============================
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from datasets import load_dataset
+import torch
+!pip install fugashi[unidic-lite]
+
+from fugashi import Tagger
+tagger = Tagger()
+
+# =============================
+# 1. 前処理 / 類似度検索
+# =============================
+def clean_text(text):
+    return text.replace("について説明してください。", "").replace("説明してください。", "")
+
+def tokenize(text):
+    text = clean_text(text)
+    words = []
+    for word in tagger(text):
+        if word.feature.pos1 not in ["助詞", "助動詞", "記号"]:
+            words.append(word.surface)
+    return set(words)
+
+def jaccard_similarity(a, b):
+    return len(a & b) / len(a | b) if (a | b) else 0
+
+def find_top_qa(prompt, dataset, n=10):
+    tokens_p = tokenize(prompt)
+    scores = []
+    for qa in dataset:
+        tokens_q = tokenize(qa["prompt"])
+        score = jaccard_similarity(tokens_p, tokens_q)
+        scores.append((score, qa))
+    scores.sort(key=lambda x: x[0], reverse=True)
+    return [qa for score, qa in scores[:n] if score > 0]
+
+
+# =============================
+# 2. データ読み込み（JSONL）
+# =============================
+dataset = load_dataset(
+    "json",
+    data_files="/content/drive/MyDrive/AIdata/makura_no_soshi_qa.jsonl",
+    split="train",
+)
+
+print("Dataset loaded:", len(dataset))
+
+
+# =============================
+# 3. モデル読み込み
+# =============================
+model_path = "/content/drive/MyDrive/AIdata/makura_no_soshi_results/final_model"
+
+tok = AutoTokenizer.from_pretrained(
+    model_path,
+    use_fast=False,
+    local_files_only=True,
+    trust_remote_code=True,
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    model_path,
+    torch_dtype=torch.float16,
+    local_files_only=True,
+    device_map="cuda",
+)
+
+
+if tok.pad_token_id == tok.eos_token_id:
+    tok.add_special_tokens({"pad_token": "<|pad|>"})
+    model.resize_token_embeddings(len(tok))
+
+
+# =============================
+# 4. 質問
+# =============================
+question = "春はどんな季節？"
+
+matches = find_top_qa(question, dataset, n=10)
+combined_output = "\n".join([m["completion"] for m in matches])
+
+prompt = f"""
+<|begin_of_text|><|start_header_id|>user<|end_header_id|>
+あなたは清少納言です。
+次の枕草子の原文を参考にして、質問に必ず答えてください。
+必ず日本語の古文で自然文の答えを生成してください。
+その時に、必ず30文字以上にしてください。
+
+{combined_output}
+
+質問: {question}
+【ここから古文で答えてください】
+<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+""".strip()
+
+inputs = tok(prompt, return_tensors="pt").to(model.device)
+
+output = model.generate(
+    **inputs,
+    max_new_tokens=1500,
+    do_sample=True,
+    top_p=0.7,
+    temperature=0.9,
+    pad_token_id=tok.pad_token_id,
+)
+
+print("\n=== 生成結果 ===\n")
+print(tok.decode(output[0], skip_special_tokens=True))
