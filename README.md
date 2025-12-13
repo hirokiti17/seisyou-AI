@@ -7,7 +7,7 @@
     + [Visual Studio code](https://code.visualstudio.com/) 
 + プログラミング言語
     + [Python 3.12](https://www.python.org/downloads/release/python-3120/)   
-+ べーうモデル
++ べースモデル
     + [elyza/Llama-3-ELYZA-JP-8B](https://huggingface.co/elyza/Llama-3-ELYZA-JP-8B)
 + その他    
     + TokenizerやTrainer等のPython PIPツール。
